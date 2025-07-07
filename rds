@@ -1,0 +1,203 @@
+Great — let’s dive into the low-level Parquet read using ParquetFileReader to load only the minimal page data necessary to extract 2 complete rows, using:
+
+ParquetFileReader from Apache Parquet (not Arrow wrapper).
+
+A custom GCS seekable stream.
+
+Manual control over reading row groups and pages.
+
+Bounded memory, optimized for large files in cloud storage.
+
+✅ Goals Recap
+Don't download the entire Parquet file.
+
+Read metadata to find the minimal set of row groups/pages to get 2 rows.
+
+Use only the required byte ranges from GCS.
+
+Load only those columns/pages needed.
+
+🧩 Required Dependencies (Maven)
+xml
+Copy
+Edit
+<dependencies>
+  <!-- Apache Parquet -->
+  <dependency>
+    <groupId>org.apache.parquet</groupId>
+    <artifactId>parquet-column</artifactId>
+    <version>1.13.1</version>
+  </dependency>
+  <dependency>
+    <groupId>org.apache.parquet</groupId>
+    <artifactId>parquet-hadoop</artifactId>
+    <version>1.13.1</version>
+  </dependency>
+  <dependency>
+    <groupId>com.google.cloud</groupId>
+    <artifactId>google-cloud-storage</artifactId>
+    <version>2.38.0</version>
+  </dependency>
+</dependencies>
+🔧 GCS SeekableInputStream (reuse from before)
+java
+Copy
+Edit
+import com.google.cloud.ReadChannel;
+import com.google.cloud.storage.Blob;
+import org.apache.parquet.io.SeekableInputStream;
+
+import java.io.IOException;
+import java.nio.ByteBuffer;
+
+public class GcsSeekableInputStream extends SeekableInputStream {
+    private final Blob blob;
+    private long position;
+    private final long size;
+
+    public GcsSeekableInputStream(Blob blob) {
+        this.blob = blob;
+        this.position = 0;
+        this.size = blob.getSize();
+    }
+
+    @Override
+    public long getPos() {
+        return position;
+    }
+
+    @Override
+    public void seek(long newPos) {
+        this.position = newPos;
+    }
+
+    @Override
+    public int read(byte[] b, int off, int len) throws IOException {
+        try (ReadChannel channel = blob.reader()) {
+            channel.seek(position);
+            ByteBuffer buffer = ByteBuffer.allocate(len);
+            int bytesRead = channel.read(buffer);
+            if (bytesRead > 0) {
+                byte[] data = buffer.array();
+                System.arraycopy(data, 0, b, off, bytesRead);
+                position += bytesRead;
+            }
+            return bytesRead;
+        }
+    }
+
+    @Override
+    public int read() throws IOException {
+        byte[] buf = new byte[1];
+        int n = read(buf, 0, 1);
+        return (n == -1) ? -1 : buf[0] & 0xFF;
+    }
+
+    @Override
+    public long length() {
+        return size;
+    }
+}
+📜 Full Program: Low-Level Parquet Read from GCS
+java
+Copy
+Edit
+import com.google.cloud.storage.*;
+import org.apache.parquet.column.ColumnDescriptor;
+import org.apache.parquet.column.page.PageReadStore;
+import org.apache.parquet.example.data.Group;
+import org.apache.parquet.example.data.simple.SimpleGroup;
+import org.apache.parquet.example.data.simple.convert.GroupRecordConverter;
+import org.apache.parquet.hadoop.metadata.BlockMetaData;
+import org.apache.parquet.hadoop.metadata.ColumnChunkMetaData;
+import org.apache.parquet.io.*;
+import org.apache.parquet.schema.MessageType;
+import org.apache.parquet.hadoop.ParquetFileReader;
+import org.apache.parquet.hadoop.util.HadoopInputFile;
+
+import org.apache.hadoop.conf.Configuration;
+import org.apache.hadoop.fs.Path;
+
+import java.io.IOException;
+import java.net.URI;
+import java.util.List;
+
+public class GcsLowLevelParquetReader {
+    public static void main(String[] args) throws IOException {
+        String bucket = "your-bucket-name";
+        String object = "your/path/to/large-file.parquet";
+
+        // Initialize GCS client
+        Storage storage = StorageOptions.getDefaultInstance().getService();
+        Blob blob = storage.get(bucket, object);
+        if (blob == null) throw new IOException("File not found in GCS.");
+
+        // Wrap GCS blob in SeekableInputStream
+        GcsSeekableInputStream seekableInput = new GcsSeekableInputStream(blob);
+
+        // Wrap in HadoopInputFile so ParquetFileReader can use it
+        Configuration conf = new Configuration();
+        HadoopInputFile inputFile = HadoopInputFile.fromSeekableInput(seekableInput, blob.getSize(), new Path("gs://" + bucket + "/" + object), conf);
+
+        try (ParquetFileReader reader = ParquetFileReader.open(inputFile)) {
+            MessageType schema = reader.getFileMetaData().getSchema();
+
+            List<BlockMetaData> blocks = reader.getRowGroups();
+            if (blocks.isEmpty()) {
+                System.out.println("No row groups found.");
+                return;
+            }
+
+            int rowsNeeded = 2;
+            int rowsRead = 0;
+
+            for (BlockMetaData block : blocks) {
+                // Read one row group at a time (minimal memory)
+                PageReadStore pages = reader.readNextRowGroup();
+                if (pages == null) break;
+
+                long rowsInGroup = pages.getRowCount();
+                System.out.println("Reading row group with " + rowsInGroup + " rows...");
+
+                RecordReader<Group> recordReader = new org.apache.parquet.example.RecordReaderImplementation<>(
+                        schema,
+                        new GroupRecordConverter(schema),
+                        pages
+                );
+
+                for (int i = 0; i < rowsInGroup && rowsRead < rowsNeeded; i++) {
+                    Group group = recordReader.read();
+                    if (group == null) break;
+                    printGroup(group);
+                    rowsRead++;
+                }
+
+                if (rowsRead >= rowsNeeded) break;
+            }
+        }
+    }
+
+    private static void printGroup(Group group) {
+        for (int i = 0; i < group.getType().getFieldCount(); i++) {
+            String fieldName = group.getType().getFieldName(i);
+            int valueCount = group.getFieldRepetitionCount(i);
+            for (int j = 0; j < valueCount; j++) {
+                System.out.print(fieldName + ": " + group.getValueToString(i, j) + "  ");
+            }
+        }
+        System.out.println();
+    }
+}
+✅ Why This Works Efficiently
+Metadata is read first: We inspect only row groups.
+
+We only load row groups/pages that may contain 2 rows.
+
+Each PageReadStore is row-group scoped, and we're stopping as soon as 2 rows are read.
+
+The GcsSeekableInputStream ensures only required byte ranges are fetched from GCS.
+
+🧠 Notes
+You can expand this to read only selected columns by adjusting ColumnReadStore.
+
+For even tighter control (e.g., down to specific pages), you’d need to parse the column chunk metadata and manually read PageHeaders.
